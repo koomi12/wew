@@ -1,11 +1,12 @@
 import { useState, useEffect } from "react";
 import { Routes, Route, Navigate, useNavigate } from "react-router-dom";
+import { supabase } from "./supabase";
 
 import Landing from "./Landing/LandingPage.jsx";
 import Login from "./e-commerce/Login.jsx";
 import Signup from "./e-commerce/Signup.jsx";
 import Dashboard from "./e-commerce/dashboard.jsx";
-import Profile from "./e-commerce/Profile.jsx";
+import Profile from "./e-commerce/profile.jsx";
 import Cart from "./e-commerce/cart.jsx";
 import Admin from "./admin/admin.jsx";
 
@@ -13,42 +14,154 @@ function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [currentRole, setCurrentRole] = useState(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [loading, setLoading] = useState(true);
   const navigate = useNavigate();
 
-  // Load auth from localStorage on page refresh
+  // Check for existing session on mount
   useEffect(() => {
-    const stored = localStorage.getItem("auth");
-    if (stored) {
-      try {
-        const parsed = JSON.parse(stored);
-        setCurrentUser(parsed.user || null);
-        setCurrentRole(parsed.role || null);
-        setIsAuthenticated(!!parsed.isAuthenticated);
-      } catch (e) {
-        console.error("Error parsing auth:", e);
+    checkSession();
+
+    // Listen for auth state changes
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
+      console.log("Auth state changed:", _event, session);
+      
+      if (session) {
+        await loadUserProfile(session.user.id);
+      } else {
+        setCurrentUser(null);
+        setCurrentRole(null);
+        setIsAuthenticated(false);
+        localStorage.removeItem("auth");
       }
-    }
+    });
+
+    return () => subscription.unsubscribe();
   }, []);
 
-  // Handle successful login/signup
-  const handleLoginSuccess = ({ user, role }) => {
-    const finalRole = role || "user"; // default role if missing
+  const checkSession = async () => {
+    try {
+      const { data: { session }, error } = await supabase.auth.getSession();
+      
+      if (error) {
+        console.error("Session check error:", error);
+        setLoading(false);
+        return;
+      }
+      
+      if (session) {
+        await loadUserProfile(session.user.id);
+      } else {
+        setLoading(false);
+      }
+    } catch (error) {
+      console.error("Session check error:", error);
+      setLoading(false);
+    }
+  };
 
+  const loadUserProfile = async (userId) => {
+    try {
+      // Add retry logic for profile fetch
+      let attempts = 0;
+      let profileData = null;
+      let error = null;
+
+      while (attempts < 3 && !profileData) {
+        const result = await supabase
+          .from('profiles')
+          .select('*')
+          .eq('id', userId)
+          .single();
+
+        profileData = result.data;
+        error = result.error;
+
+        if (error && attempts < 2) {
+          console.log(`Profile fetch attempt ${attempts + 1} failed, retrying...`);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          attempts++;
+        } else {
+          break;
+        }
+      }
+
+      if (error) {
+        console.error("Profile load error after retries:", error);
+        // If profile doesn't exist, create it
+        const { data: { user } } = await supabase.auth.getUser();
+        
+        if (user) {
+          const { error: insertError } = await supabase
+            .from('profiles')
+            .insert([{
+              id: user.id,
+              email: user.email,
+              full_name: user.user_metadata?.full_name || 'User',
+              role: 'user'
+            }]);
+
+          if (insertError && insertError.code !== '23505') {
+            console.error("Profile creation error:", insertError);
+          } else {
+            // Try fetching again
+            const { data: newProfile } = await supabase
+              .from('profiles')
+              .select('*')
+              .eq('id', userId)
+              .single();
+            
+            profileData = newProfile;
+          }
+        }
+      }
+
+      if (profileData) {
+        const role = profileData.role || 'user';
+        const email = profileData.email || '';
+
+        setCurrentUser(email);
+        setCurrentRole(role);
+        setIsAuthenticated(true);
+
+        localStorage.setItem(
+          "auth",
+          JSON.stringify({
+            user: email,
+            role: role,
+            isAuthenticated: true,
+            userId: userId
+          })
+        );
+      }
+    } catch (error) {
+      console.error("Profile load error:", error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleLoginSuccess = async ({ user, role, userId }) => {
+    console.log("Login success:", { user, role, userId });
+    
     setCurrentUser(user);
-    setCurrentRole(finalRole);
+    setCurrentRole(role);
     setIsAuthenticated(true);
 
     localStorage.setItem(
       "auth",
       JSON.stringify({
         user,
-        role: finalRole,
+        role,
         isAuthenticated: true,
+        userId
       })
     );
 
+    // Small delay to ensure state is set
+    await new Promise(resolve => setTimeout(resolve, 100));
+
     // Redirect after login
-    if (finalRole === "admin") {
+    if (role === "admin") {
       navigate("/admin", { replace: true });
     } else {
       navigate("/dashboard", { replace: true });
@@ -57,61 +170,82 @@ function App() {
 
   // Protect routes
   const requireAuth = (element, requiredRole) => {
-    if (isAuthenticated) {
-      // If role mismatch
-      if (requiredRole && currentRole !== requiredRole) {
-        return <Navigate to="/dashboard" replace />;
-      }
-      return element;
+    if (loading) {
+      return (
+        <div className="min-h-screen bg-gray-100 flex items-center justify-center">
+          <div className="animate-pulse">
+            <div className="text-gray-600 text-lg">Loading...</div>
+          </div>
+        </div>
+      );
     }
 
-    // Auto-restore from localStorage if possible
-    const stored = localStorage.getItem("auth");
-    if (stored) {
-      try {
-        const parsed = JSON.parse(stored);
-        if (parsed.isAuthenticated) {
-          setCurrentUser(parsed.user || null);
-          setCurrentRole(parsed.role || "user");
-          setIsAuthenticated(true);
-
-          if (requiredRole && parsed.role !== requiredRole) {
-            return <Navigate to="/dashboard" replace />;
-          }
-          return element;
-        }
-      } catch (e) {
-        console.error("Error checking auth:", e);
-      }
+    if (!isAuthenticated) {
+      console.log("Not authenticated, redirecting to landing");
+      return <Navigate to="/" replace />;
     }
 
-    return <Navigate to="/" replace />;
+    // If role mismatch
+    if (requiredRole && currentRole !== requiredRole) {
+      console.log(`Role mismatch: required ${requiredRole}, current ${currentRole}`);
+      return <Navigate to="/dashboard" replace />;
+    }
+
+    return element;
   };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-gray-100 flex items-center justify-center">
+        <div className="animate-pulse">
+          <div className="text-gray-600 text-lg">Loading...</div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <Routes>
       {/* Landing Page */}
       <Route
         path="/"
-        element={<Landing onLoginSuccess={handleLoginSuccess} />}
+        element={
+          isAuthenticated ? (
+            <Navigate to={currentRole === "admin" ? "/admin" : "/dashboard"} replace />
+          ) : (
+            <Landing onLoginSuccess={handleLoginSuccess} />
+          )
+        }
       />
 
       {/* Login */}
       <Route
         path="/login"
-        element={<Login onLoginSuccess={handleLoginSuccess} />}
+        element={
+          isAuthenticated ? (
+            <Navigate to={currentRole === "admin" ? "/admin" : "/dashboard"} replace />
+          ) : (
+            <Login onLoginSuccess={handleLoginSuccess} />
+          )
+        }
       />
 
       {/* Signup */}
       <Route
         path="/signup"
-        element={<Signup onLoginSuccess={handleLoginSuccess} />}
+        element={
+          isAuthenticated ? (
+            <Navigate to={currentRole === "admin" ? "/admin" : "/dashboard"} replace />
+          ) : (
+            <Signup onLoginSuccess={handleLoginSuccess} />
+          )
+        }
       />
 
       {/* Dashboard (Authenticated: ANY ROLE) */}
       <Route
         path="/dashboard"
-        element={requireAuth(<Dashboard />)} // <-- FIXED
+        element={requireAuth(<Dashboard />)}
       />
 
       {/* Profile */}

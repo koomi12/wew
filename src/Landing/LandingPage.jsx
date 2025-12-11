@@ -16,7 +16,7 @@ export default function Landing({ onLoginSuccess }) {
           <header className="flex items-center justify-between px-6 sm:px-10 py-5 bg-gradient-to-tl from-orange-600 via-orange-400 to-amber-300">
             <div className="flex items-center gap-2">
               <img
-                src="/pic/model.jpg"
+                src="/pic/model.png"
                 alt="TeeCraft logo"
                 className="h-8 w-8 rounded-full object-cover border border-black/20"
               />

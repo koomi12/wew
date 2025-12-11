@@ -1,11 +1,14 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
+import { supabase } from "../supabase";
 
 export default function Cart() {
   const [cartItems, setCartItems] = useState([]);
   const [selectedItemForEdit, setSelectedItemForEdit] = useState(null);
   const [selectedColor, setSelectedColor] = useState("");
   const [selectedSize, setSelectedSize] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [userId, setUserId] = useState(null);
 
   const navigate = useNavigate();
 
@@ -25,37 +28,121 @@ export default function Cart() {
   const availableSizes = ["XS", "S", "M", "L", "XL", "2XL"];
 
   useEffect(() => {
-    const stored = localStorage.getItem("cart");
-    if (stored) {
-      try {
-        setCartItems(JSON.parse(stored));
-      } catch (e) {
-        console.error("Error loading cart:", e);
-      }
-    }
+    checkAuth();
   }, []);
 
-  const saveCart = (items) => {
-    setCartItems(items);
-    localStorage.setItem("cart", JSON.stringify(items));
+  useEffect(() => {
+    if (userId) fetchCartItems();
+  }, [userId]);
+
+  const checkAuth = async () => {
+    try {
+      const { data: { session }, error } = await supabase.auth.getSession();
+      if (error || !session) {
+        const stored = localStorage.getItem("auth");
+        if (stored) setUserId(JSON.parse(stored).userId);
+        else navigate("/");
+      } else setUserId(session.user.id);
+    } catch (error) {
+      console.error("Auth check error:", error);
+      navigate("/");
+    }
   };
 
-  const removeItem = (cartId) => {
-    const updated = cartItems.filter((item) => item.cartId !== cartId);
-    saveCart(updated);
+  const fetchCartItems = async () => {
+    if (!userId) return;
+    try {
+      setLoading(true);
+      const { data, error } = await supabase
+        .from("cart")
+        .select(`
+          id,
+          quantity,
+          product_id,
+          product_variant_id,
+          products (
+            id,
+            name,
+            price,
+            image_url
+          ),
+          product_variants (
+            id,
+            color,
+            size
+          )
+        `)
+        .eq("user_id", userId);
+
+      if (error) throw error;
+
+      const formattedItems = data.map((item) => ({
+        cartId: item.id,
+        id: item.products.id,
+        name: item.products.name,
+        price: parseFloat(item.products.price),
+        image: item.products.image_url,
+        color: item.product_variants.color,
+        size: item.product_variants.size,
+        quantity: item.quantity,
+        variantId: item.product_variants.id,
+        selected: true,
+      }));
+
+      setCartItems(formattedItems);
+    } catch (error) {
+      console.error("Error fetching cart:", error);
+      alert("Failed to load cart items");
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const updateQuantity = (cartId, delta) => {
-    const updated = cartItems.map((item) =>
-      item.cartId === cartId
-        ? { ...item, quantity: Math.max(1, item.quantity + delta) }
-        : item
-    );
-    saveCart(updated);
+  const updateQuantity = async (cartId, delta) => {
+    try {
+      const item = cartItems.find((i) => i.cartId === cartId);
+      const newQuantity = Math.max(1, item.quantity + delta);
+
+      const { error } = await supabase
+        .from("cart")
+        .update({ quantity: newQuantity })
+        .eq("id", cartId);
+
+      if (error) throw error;
+
+      setCartItems(
+        cartItems.map((i) =>
+          i.cartId === cartId ? { ...i, quantity: newQuantity } : i
+        )
+      );
+    } catch (error) {
+      console.error("Error updating quantity:", error);
+      alert("Failed to update quantity");
+    }
   };
 
-  const clearCart = () => {
-    saveCart([]);
+  const removeItem = async (cartId) => {
+    if (!confirm("Remove this item from cart?")) return;
+    try {
+      const { error } = await supabase.from("cart").delete().eq("id", cartId);
+      if (error) throw error;
+      setCartItems(cartItems.filter((item) => item.cartId !== cartId));
+    } catch (error) {
+      console.error("Error removing item:", error);
+      alert("Failed to remove item");
+    }
+  };
+
+  const clearCart = async () => {
+    if (!confirm("Clear all items from cart?")) return;
+    try {
+      const { error } = await supabase.from("cart").delete().eq("user_id", userId);
+      if (error) throw error;
+      setCartItems([]);
+    } catch (error) {
+      console.error("Error clearing cart:", error);
+      alert("Failed to clear cart");
+    }
   };
 
   const openEditModal = (item) => {
@@ -64,83 +151,192 @@ export default function Cart() {
     setSelectedSize(item.size);
   };
 
-  const saveEditChanges = () => {
+  const saveEditChanges = async () => {
     if (!selectedColor || !selectedSize) return;
+    try {
+      // Fetch existing variant
+      let { data: variant, error: variantError } = await supabase
+        .from("product_variants")
+        .select("id")
+        .eq("product_id", selectedItemForEdit.id)
+        .eq("color", selectedColor)
+        .eq("size", selectedSize)
+        .single();
 
-    let updated = [...cartItems];
+      if (variantError && variantError.code === "PGRST116") {
+        // Create new variant if not exists
+        const { data: newVariant, error: createError } = await supabase
+          .from("product_variants")
+          .insert({
+            product_id: selectedItemForEdit.id,
+            color: selectedColor,
+            size: selectedSize,
+            stock_quantity: 100,
+          })
+          .select()
+          .single();
 
-    // NEW cartId based on updated selections
-    const newCartId = `${selectedItemForEdit.id}-${selectedColor}-${selectedSize}`;
+        if (createError) throw createError;
+        variant = newVariant;
+      } else if (variantError) {
+        throw variantError;
+      }
 
-    // If another item already exists with same new color+size → merge quantities
-    const existing = updated.find(
-      (i) => i.cartId === newCartId && i.cartId !== selectedItemForEdit.cartId
-    );
+      // Check if cart already has this variant
+      const { data: existingItem } = await supabase
+        .from("cart")
+        .select("*")
+        .eq("user_id", userId)
+        .eq("product_id", selectedItemForEdit.id)
+        .eq("product_variant_id", variant.id)
+        .single();
 
-    if (existing) {
-      existing.quantity += selectedItemForEdit.quantity;
-      updated = updated.filter((i) => i.cartId !== selectedItemForEdit.cartId);
-    } else {
-      updated = updated.map((i) =>
-        i.cartId === selectedItemForEdit.cartId
-          ? {
-              ...i,
-              color: selectedColor,
-              size: selectedSize,
-              cartId: newCartId,
-            }
-          : i
-      );
+      if (existingItem && existingItem.id !== selectedItemForEdit.cartId) {
+        // Merge quantities
+        const { error: updateError } = await supabase
+          .from("cart")
+          .update({ quantity: existingItem.quantity + selectedItemForEdit.quantity })
+          .eq("id", existingItem.id);
+        if (updateError) throw updateError;
+
+        const { error: deleteError } = await supabase
+          .from("cart")
+          .delete()
+          .eq("id", selectedItemForEdit.cartId);
+        if (deleteError) throw deleteError;
+      } else {
+        // Update current cart item
+        const { error } = await supabase
+          .from("cart")
+          .update({ product_variant_id: variant.id })
+          .eq("id", selectedItemForEdit.cartId);
+        if (error) throw error;
+      }
+
+      setSelectedItemForEdit(null);
+      await fetchCartItems();
+    } catch (error) {
+      console.error("Error updating item:", error);
+      alert("Failed to update item");
     }
-
-    saveCart(updated);
-    setSelectedItemForEdit(null);
   };
 
-  const subtotal = cartItems
-    .filter((item) => item.selected !== false)
-    .reduce((sum, item) => sum + item.price * item.quantity, 0);
+  const subtotal = parseFloat(
+    cartItems
+      .filter((item) => item.selected !== false)
+      .reduce((sum, item) => sum + item.price * item.quantity, 0)
+      .toFixed(2)
+  );
+
+  const handleCheckout = async () => {
+    const selectedItems = cartItems.filter((item) => item.selected !== false);
+
+    if (!userId) {
+      alert("You must be logged in to checkout");
+      return;
+    }
+
+    if (selectedItems.length === 0) {
+      alert("Please select items to checkout");
+      return;
+    }
+
+    try {
+      const { data: order, error: orderError } = await supabase
+        .from("orders")
+        .insert({
+          user_id: userId,
+          total: subtotal,
+          status: "pending",
+        })
+        .select()
+        .single();
+      if (orderError) throw orderError;
+
+      const orderItems = selectedItems.map((item) => ({
+        order_id: order.id,
+        product_id: item.id,
+        product_variant_id: item.variantId,
+        quantity: item.quantity,
+        price: parseFloat(item.price.toFixed(2)),
+      }));
+
+      const { error: itemsError } = await supabase
+        .from("order_items")
+        .insert(orderItems);
+      if (itemsError) throw itemsError;
+
+      const cartIds = selectedItems.map((item) => item.cartId);
+      const { error: deleteError } = await supabase
+        .from("cart")
+        .delete()
+        .in("id", cartIds);
+      if (deleteError) throw deleteError;
+
+      alert("Order placed successfully!");
+      await fetchCartItems();
+    } catch (error) {
+      console.error("Checkout error:", error);
+      alert("Failed to place order. Please try again.");
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-gray-100 flex items-center justify-center">
+        <div className="text-gray-600">Loading cart...</div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-gray-100 pb-24">
       {/* Header */}
       <header className="bg-orange-500 px-6 py-3 flex items-center justify-between">
         <h1 className="text-white text-2xl font-bold min-w-[120px]">Tee-Shirt</h1>
-
         <div className="flex items-center gap-5">
           <button
             onClick={() => navigate("/dashboard")}
             className="text-white hover:text-orange-100 transition flex items-center gap-2"
           >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+            <svg
+              className="w-5 h-5"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M10 19l-7-7m0 0l7-7m-7 7h18"
+              />
             </svg>
             Continue Shopping
           </button>
 
-          <button onClick={() => navigate("/profile")} className="hover:opacity-80 transition">
+          <button
+            onClick={() => navigate("/profile")}
+            className="hover:opacity-80 transition"
+          >
             <img src="/icons/acc.png" alt="User" className="w-6 h-6" />
           </button>
         </div>
       </header>
 
-      {/* MAIN CART */}
+      {/* Main Cart */}
       <main className="max-w-7xl mx-auto px-4 py-6">
-
-        {/* Select All */}
         {cartItems.length > 0 && (
           <div className="bg-white p-4 mb-4 rounded-lg shadow flex items-center gap-4">
             <input
               type="checkbox"
               className="w-5 h-5"
               checked={cartItems.every((item) => item.selected !== false)}
-              onChange={(e) => {
-                const updated = cartItems.map((item) => ({
-                  ...item,
-                  selected: e.target.checked
-                }));
-                saveCart(updated);
-              }}
+              onChange={(e) =>
+                setCartItems(
+                  cartItems.map((item) => ({ ...item, selected: e.target.checked }))
+                )
+              }
             />
             <span className="font-medium text-gray-700">Select All</span>
 
@@ -153,7 +349,6 @@ export default function Cart() {
           </div>
         )}
 
-        {/* EMPTY CART */}
         {cartItems.length === 0 ? (
           <div className="bg-white p-10 rounded-xl shadow text-center">
             <h2 className="text-xl font-semibold mb-3">Your cart is empty</h2>
@@ -171,49 +366,41 @@ export default function Cart() {
                 key={item.cartId}
                 className="bg-white p-4 rounded-lg shadow flex items-center gap-4"
               >
-                {/* Checkbox */}
                 <input
                   type="checkbox"
                   className="w-5 h-5"
                   checked={item.selected !== false}
-                  onChange={(e) => {
-                    const updated = cartItems.map((c) =>
-                      c.cartId === item.cartId
-                        ? { ...c, selected: e.target.checked }
-                        : c
-                    );
-                    saveCart(updated);
-                  }}
+                  onChange={(e) =>
+                    setCartItems(
+                      cartItems.map((c) =>
+                        c.cartId === item.cartId
+                          ? { ...c, selected: e.target.checked }
+                          : c
+                      )
+                    )
+                  }
                 />
 
-                {/* Image */}
                 <img
                   src={item.image}
                   alt={item.name}
                   className="w-20 h-20 rounded-md object-cover"
                 />
 
-                {/* Info */}
                 <div className="flex-1">
                   <p className="font-medium text-gray-900">{item.name}</p>
-
-                  <p className="text-sm text-gray-500">
-                    {item.color} • {item.size}
-                  </p>
-
+                  <p className="text-sm text-gray-500">{item.color} • {item.size}</p>
                   <button
                     className="text-orange-500 text-xs underline mt-1"
                     onClick={() => openEditModal(item)}
                   >
                     Edit
                   </button>
-
                   <p className="mt-1 font-bold text-orange-600 text-lg">
                     ₱ {item.price.toLocaleString()}
                   </p>
                 </div>
 
-                {/* Quantity */}
                 <div className="flex items-center border rounded-md overflow-hidden">
                   <button
                     onClick={() => updateQuantity(item.cartId, -1)}
@@ -230,13 +417,22 @@ export default function Cart() {
                   </button>
                 </div>
 
-                {/* Delete */}
                 <button
                   onClick={() => removeItem(item.cartId)}
                   className="text-red-500 hover:text-red-600"
                 >
-                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                  <svg
+                    className="w-6 h-6"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                    />
                   </svg>
                 </button>
               </div>
@@ -245,7 +441,6 @@ export default function Cart() {
         )}
       </main>
 
-      {/* TOTAL BAR */}
       {cartItems.length > 0 && (
         <div className="fixed bottom-0 left-0 w-full bg-white shadow-lg py-4 px-6 flex items-center justify-between">
           <div className="flex items-center gap-2 text-gray-600">
@@ -254,18 +449,18 @@ export default function Cart() {
               ₱ {subtotal.toLocaleString()}
             </span>
           </div>
-
-          <button className="bg-orange-500 hover:bg-orange-600 text-white px-8 py-3 rounded-lg font-medium">
+          <button
+            onClick={handleCheckout}
+            className="bg-orange-500 hover:bg-orange-600 text-white px-8 py-3 rounded-lg font-medium"
+          >
             Checkout
           </button>
         </div>
       )}
 
-      {/* EDIT COLOR & SIZE MODAL */}
       {selectedItemForEdit && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
           <div className="relative w-[90%] max-w-md bg-white rounded-2xl shadow-2xl p-6">
-
             <button
               onClick={() => setSelectedItemForEdit(null)}
               className="absolute top-4 right-4 text-gray-400 hover:text-gray-600 text-2xl font-bold"
@@ -292,12 +487,10 @@ export default function Cart() {
               </div>
             </div>
 
-            {/* COLOR */}
             <div className="mb-6">
               <label className="block text-sm font-semibold text-gray-700 mb-3">
                 Select Color ({selectedColor})
               </label>
-
               <div className="grid grid-cols-5 gap-3">
                 {availableColors.map((color) => (
                   <button
@@ -317,12 +510,10 @@ export default function Cart() {
               </div>
             </div>
 
-            {/* SIZE */}
             <div className="mb-6">
               <label className="block text-sm font-semibold text-gray-700 mb-3">
                 Select Size
               </label>
-
               <div className="grid grid-cols-3 gap-2">
                 {availableSizes.map((size) => (
                   <button

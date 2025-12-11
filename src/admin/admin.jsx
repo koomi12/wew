@@ -15,35 +15,65 @@ export default function Admin() {
 
   useEffect(() => {
     checkAdminAccess();
-  }, [navigate]);
+  }, []);
 
   const checkAdminAccess = async () => {
     try {
-      const { data: { session } } = await supabase.auth.getSession();
+      setLoading(true);
       
-      if (!session) {
+      // Get current session
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      
+      console.log("Admin check - Session:", session);
+      
+      if (sessionError) {
+        console.error("Session error:", sessionError);
         navigate("/");
         return;
       }
 
-      const { data: profileData, error } = await supabase
+      if (!session) {
+        console.log("No session found, redirecting to home");
+        navigate("/");
+        return;
+      }
+
+      // Get user profile
+      const { data: profileData, error: profileError } = await supabase
         .from("profiles")
         .select("*")
         .eq("id", session.user.id)
         .single();
 
-      if (error) throw error;
+      console.log("Admin check - Profile data:", profileData);
+      console.log("Admin check - Profile error:", profileError);
 
-      if (profileData.role !== "admin") {
+      if (profileError) {
+        console.error("Error fetching profile:", profileError);
+        alert("Error loading profile. Please try logging in again.");
+        navigate("/");
+        return;
+      }
+
+      // CRITICAL: Check if user has admin role
+      if (!profileData || profileData.role !== "admin") {
+        console.log("User role:", profileData?.role, "- Access denied");
+        alert("Access Denied: Admin privileges required");
         navigate("/dashboard");
         return;
       }
 
+      console.log("Admin access granted");
       setProfile(profileData);
+      
+      // Load admin data
       await Promise.all([fetchUsers(), fetchOrders()]);
     } catch (error) {
       console.error("Error checking admin access:", error);
+      alert("An error occurred. Please try logging in again.");
       navigate("/");
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -55,11 +85,10 @@ export default function Admin() {
         .order("created_at", { ascending: false });
 
       if (error) throw error;
+      console.log("Fetched users:", data);
       setUsers(data || []);
     } catch (error) {
       console.error("Error fetching users:", error);
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -96,6 +125,7 @@ export default function Admin() {
         createdAt: order.created_at
       }));
 
+      console.log("Fetched orders:", formattedOrders);
       setOrders(formattedOrders);
     } catch (error) {
       console.error("Error fetching orders:", error);
@@ -139,13 +169,20 @@ export default function Admin() {
   };
 
   const handleLogout = async () => {
+    if (!confirm("Are you sure you want to logout?")) return;
+    
     try {
       const { error } = await supabase.auth.signOut();
       if (error) throw error;
+      localStorage.removeItem("auth");
       navigate("/", { replace: true });
     } catch (error) {
       console.error("Error logging out:", error);
     }
+  };
+
+  const goToProfile = () => {
+    navigate("/profile");
   };
 
   const getStatusColor = (status) => {
@@ -190,15 +227,21 @@ export default function Admin() {
         <h1 className="text-white text-2xl font-bold">Admin Dashboard</h1>
 
         <div className="flex items-center gap-4">
-          <span className="text-white text-sm">{profile?.email}</span>
+          <div className="text-right mr-2">
+            <p className="text-white text-sm font-medium">{profile?.full_name || "Admin"}</p>
+            <p className="text-orange-100 text-xs">{profile?.email}</p>
+          </div>
+          
           <button
-            onClick={() => navigate("/profile")}
+            onClick={goToProfile}
             className="text-white hover:text-orange-100 transition"
+            title="View Profile"
           >
             <svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
             </svg>
           </button>
+          
           <button
             onClick={handleLogout}
             className="bg-white text-orange-600 px-4 py-2 rounded-lg font-medium hover:bg-orange-50 transition"
